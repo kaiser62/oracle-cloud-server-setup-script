@@ -10,7 +10,7 @@
  * stop the launcher.
  */
 
-export type AttemptResult = "capacity" | "ratelimit" | "error" | "created";
+export type AttemptResult = "capacity" | "ratelimit" | "network" | "error" | "created";
 type TargetStatus = AttemptResult | "pending" | "exists";
 
 interface TargetState {
@@ -101,6 +101,7 @@ const ICON: Record<TargetStatus, string> = {
 	pending: "⏳",
 	capacity: "🔴",
 	ratelimit: "🟠",
+	network: "📡",
 	error: "❌",
 	created: "✅",
 	exists: "✅",
@@ -110,10 +111,18 @@ const LABEL: Record<TargetStatus, string> = {
 	pending: "waiting",
 	capacity: "out of capacity",
 	ratelimit: "rate limited",
+	network: "network error",
 	error: "error",
 	created: "created",
 	exists: "already exists",
 };
+
+/** Consecutive network failures before an outage card is posted (filters one-off blips). */
+const OUTAGE_THRESHOLD = 3;
+/** Identical error cards are posted at most once per window. */
+const ERROR_DEDUPE_MS = 60 * 60 * 1000;
+/** Event cards waiting beyond this are dropped, so a long Discord outage can't flush a stale backlog later. */
+const MAX_PENDING_EVENTS = 10;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const unix = (d: Date) => Math.floor(d.getTime() / 1000);
@@ -126,6 +135,14 @@ export class DiscordNotifier {
 	private queue: Promise<unknown> = Promise.resolve();
 	private statusMessageId?: string;
 	private statusQueued = false;
+	private pendingEvents = 0;
+	private droppedEvents = 0;
+	private readonly lastErrorPost = new Map<string, number>();
+
+	private networkStreak = 0;
+	private networkFailures = 0;
+	private outageSince?: Date;
+	private outageAnnounced = false;
 
 	private readonly accounts = new Map<string, AccountState>();
 	private readonly startedAt = new Date();
@@ -187,7 +204,13 @@ export class DiscordNotifier {
 			target.capacityHits++;
 			this.capacityHits++;
 		}
-		if (result === "error" && detail) {
+		if (result === "network") {
+			this.networkDown(detail);
+			return;
+		}
+		this.networkUp();
+
+		if (result === "error" && detail && this.shouldPostError(`${accountLabel}|${detail}`)) {
 			this.post({
 				title: `❌ Launch failed — ${targetName}`,
 				description: `${flag(this.region(accountLabel))} **${accountLabel}**\n\`\`\`\n${clip(detail, 3800)}\n\`\`\``,
@@ -195,6 +218,47 @@ export class DiscordNotifier {
 				timestamp: new Date().toISOString(),
 			});
 		}
+	}
+
+	/** OCI unreachable (no HTTP response): one card per outage instead of one per attempt. */
+	private networkDown(detail?: string) {
+		this.networkStreak++;
+		this.networkFailures++;
+		this.outageSince ??= new Date();
+		if (this.networkStreak === OUTAGE_THRESHOLD && !this.outageAnnounced) {
+			this.outageAnnounced = true;
+			this.post({
+				title: "📡 Network problem",
+				description: `Can't reach the OCI API since <t:${unix(this.outageSince)}:R>. Still retrying; this card won't repeat until it recovers.${detail ? `\n\`\`\`\n${clip(detail, 500)}\n\`\`\`` : ""}`,
+				color: COLOR.warn,
+				timestamp: new Date().toISOString(),
+			});
+			this.pushStatus();
+		}
+	}
+
+	private networkUp() {
+		if (this.outageAnnounced && this.outageSince) {
+			const minutes = Math.max(1, Math.round((Date.now() - this.outageSince.getTime()) / 60000));
+			this.post({
+				title: "📶 Network recovered",
+				description: `OCI API reachable again after ~${minutes} min (${this.networkFailures} failed attempts).`,
+				color: COLOR.success,
+				timestamp: new Date().toISOString(),
+			});
+		}
+		this.networkStreak = 0;
+		this.networkFailures = 0;
+		this.outageSince = undefined;
+		this.outageAnnounced = false;
+	}
+
+	private shouldPostError(key: string): boolean {
+		const now = Date.now();
+		const last = this.lastErrorPost.get(key);
+		if (last !== undefined && now - last < ERROR_DEDUPE_MS) return false;
+		this.lastErrorPost.set(key, now);
+		return true;
 	}
 
 	cycleCompleted(cycle: number, waitSeconds: number) {
@@ -301,6 +365,9 @@ export class DiscordNotifier {
 			`📦 Instances **${done}/${all.length}** created`,
 			`🕒 Running since <t:${unix(this.startedAt)}:R>`,
 		];
+		if (this.outageAnnounced && this.outageSince) {
+			lines.push(`📡 **OCI unreachable** since <t:${unix(this.outageSince)}:R> (${this.networkFailures} failed attempts)`);
+		}
 		if (!this.finished && this.nextAttemptAt) {
 			lines.push(`⏭️ Next attempt <t:${unix(this.nextAttemptAt)}:R>`);
 		}
@@ -348,7 +415,19 @@ export class DiscordNotifier {
 
 	private post(embed: Embed) {
 		if (!this.url) return;
-		this.enqueue(() => this.request("POST", "", { embeds: [embed] }));
+		if (this.pendingEvents >= MAX_PENDING_EVENTS) {
+			this.droppedEvents++;
+			return;
+		}
+		this.pendingEvents++;
+		this.enqueue(async () => {
+			this.pendingEvents--;
+			if (this.droppedEvents > 0) {
+				console.error(`[DISCORD] Dropped ${this.droppedEvents} notification(s) while Discord was unreachable.`);
+				this.droppedEvents = 0;
+			}
+			await this.request("POST", "", { embeds: [embed] });
+		});
 	}
 
 	private enqueue(task: () => Promise<unknown>) {
@@ -356,12 +435,14 @@ export class DiscordNotifier {
 	}
 
 	private async request(method: "POST" | "PATCH", path: string, body: object): Promise<unknown> {
+		let networkErrors = 0;
 		for (let attempt = 0; attempt < 5; attempt++) {
 			try {
 				const res = await fetch(`${this.url}${path}`, {
 					method,
 					headers: { "Content-Type": "application/json" },
 					body: JSON.stringify({ allowed_mentions: { parse: [] }, ...body }),
+					signal: AbortSignal.timeout(15000),
 				});
 				if (res.ok) return res.status === 204 ? null : await res.json();
 				if (res.status === 429) {
@@ -373,9 +454,13 @@ export class DiscordNotifier {
 				console.error(`[DISCORD] Webhook ${method} failed (${res.status}): ${clip(await res.text(), 200)}`);
 				return null;
 			} catch (err: unknown) {
-				const msg = err instanceof Error ? err.message : String(err);
-				console.error(`[DISCORD] Webhook request error: ${msg}`);
-				await sleep(2000);
+				// Discord unreachable: give up after a few tries and log once, not per try
+				if (++networkErrors >= 3) {
+					const msg = err instanceof Error ? err.message : String(err);
+					console.error(`[DISCORD] Webhook ${method} gave up after ${networkErrors} network errors: ${msg}`);
+					return null;
+				}
+				await sleep(2000 * networkErrors);
 			}
 		}
 		return null;

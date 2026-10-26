@@ -302,6 +302,13 @@ function handleLaunchError(
 		return "capacity";
 	}
 
+	if (status === undefined) {
+		// No HTTP response (DNS/connection failure, e.g. "fetch failed"): transient, not a launch rejection
+		console.log(`Network error on ${account.config.label}: ${msg}`);
+		discord.attempt(account.config.label, targetName, "network", msg);
+		return "network";
+	}
+
 	console.log(`Failed on ${account.config.label} (Status: ${status}, Code: ${code}): ${msg}`);
 	if (status === 400 || status === 401 || status === 404) {
 		console.error(
